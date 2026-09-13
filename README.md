@@ -41,33 +41,33 @@ Aside from two or three minor exceptions, I was responsible for essentially ever
 
 ## Trading System
 
-This is the piece I'm proudest of. Player-to-player trading is historically one of the easiest systems to exploit on Roblox — duplication ("duping") bugs, where a player trades an item and ends up keeping a copy of it, are the most common and most damaging exploit across games on the platform.
+The piece I'm proudest of. Item duplication ("duping") — trading an item and ending up with a copy of it — is the most common exploit in games like this. The trading system prevents it through several layers:
 
-To prevent this, the trading system combines several layers of protection:
+- **State-gated trade objects.** Each trade tracks `Active`, `Processing`, or `Complete`, and every client action (offer, confirm, cancel) is gated by that state so nothing can change mid-settlement.
+- **Confirmation re-arming.** Any offer change after confirming un-confirms both sides, preventing last-second swaps.
+- **Atomic settlement with rollback.** Both inventories are snapshotted before anything moves. Items are removed from both sides before anything is granted; if any step fails, both snapshots are restored and any related counters are diffed back to their prior state.
+- **Datastore-health gating.** Trades refuse to finalize if the datastore is in a critical or closing state.
+- **Shutdown safety.** In-progress trades get a grace window on server shutdown and player-leaving so a settlement isn't cut off mid-write.
 
-- **Session locking** — each active trade is represented by its own stateful object that tracks whether it's `Active`, `Processing`, or `Complete`, and every client-facing action (offering items, confirming, canceling) is gated by that state so nothing can be modified mid-settlement.
-- **A confirmation countdown with re-arming** — both players must confirm, and any change to the offer after confirming automatically un-confirms both sides, preventing last-second offer swaps.
-- **Atomic settlement with rollback** — when a trade finalizes, both players' inventories are snapshotted first. Items are removed from both sides before anything is granted; if any step fails partway through, both snapshots are restored exactly as they were, and any stat/counter side effects (like tower-count tracking) are diffed and reversed so nothing drifts out of sync.
-- **Datastore-health gating** — trades refuse to finalize at all if the datastore is in a critical or closing state, rather than risk a write landing in an inconsistent place.
-- **Server shutdown safety** — trades in the middle of processing are given a grace window on `BindToClose` and player-leaving so a settlement isn't cut off mid-write.
-
-We backed this system with a **$300 bounty** at launch for anyone who could produce a working dupe exploit. Over five experienced exploiters attempted it and failed. Across hundreds of thousands of trades processed since release, there has not been a single reported duplication incident.
+Backed by a **$300 bounty** at launch for anyone who could produce a working dupe. Five experienced exploiters tried and failed. Zero reported dupes across hundreds of thousands of trades since release.
 
 ## Quest System
 
-The quest system manages daily, weekly, lifetime, and clan-specific quest categories per player, with a few reliability details I put real thought into:
+Manages daily, weekly, lifetime, and clan quest categories per player. Every quest type shares one interface — `isComplete`, `title`, `textGoal`, `textProgress`, `percentProgress` — so new quest types drop into the pool without touching the core service.
 
-- **Refresh-in-progress guards** — because quest refresh logic reads and writes through an async data layer, overlapping refresh calls for the same player (e.g. triggered by network hiccups) are blocked from running concurrently, which prevents duplicate quest batches from ever being generated.
-- **Self-healing corruption detection** — if a player's quest list is ever found missing a daily or weekly quest (from a bad state, failed write, etc.), the system detects it and regenerates that category automatically, rather than leaving the player permanently stuck.
-- **Clan quests as a fixed active set** — rather than expiring on a timer, clan quests always maintain a fixed number of active slots per player, refilled immediately when one is claimed. An anti-farming cap prevents the random slot rolls from stacking duplicate quest types, ensuring variety and preventing passive-farming strategies.
-- **Periodic self-healing sweep** — a background loop periodically re-checks every trackable player and tops up any missing quest slots, so a single dropped event (e.g. a one-shot check that lost a timing race) can't leave a player quest-less for an entire session.
+- **Refresh-in-progress guards.** Overlapping refresh calls for the same player (from the async data layer) are blocked from running concurrently, preventing duplicate quest batches.
+- **Self-healing corruption detection.** A player missing a daily or weekly quest gets that category regenerated automatically.
+- **Anti-farming caps.** Clan quests draw from a shared pool with per-identifier caps, so a player's active slots can't all roll the same low-effort quest type.
+- **Periodic sweep.** A background loop re-checks trackable players and tops up missing slots, so one dropped event can't leave a player quest-less for a session.
+- **Data-driven reward scaling.** Each category has its own difficulty range and reward rate, so longer-requirement rolls pay out proportionally more. Lifetime quests add a small chance of rare items on top, scaled the same way.
+- **Decoupled reward calculation.** What a quest *will* reward is computed separately from granting it, so the UI can preview rewards without an active quest handler.
 
 ## Distributed Leaderboard System
 
-The leaderboard service is built to support large-scale, cross-server ranked leaderboards (up to 20,000 tracked players) without any single server becoming a bottleneck or a point of failure:
+A cross-server leaderboard for endless mode: tracks up to 20,000 ranked players, resets on a season timer, pays out rewards to top ranks at season end. The core challenge is that many servers run in parallel with no shared memory — only the datastore ties them together.
 
-- **Cross-server build locking** — only one server at a time builds a given leaderboard's snapshot, coordinated through a token-based lock stored in the datastore itself. If a build runs long and its lock expires, a stale finalize is detected and safely discarded rather than clobbering fresher data.
-- **Budget-aware pacing** — instead of fixed sleep intervals, datastore calls check Roblox's live request budget and only wait when there's actually contention, which keeps normal cycles fast while still avoiding throttling during bursts (e.g. paginated leaderboard reads or metadata enrichment).
-- **Read-anywhere caching** — any server can serve a leaderboard snapshot on demand, independent of which server built it, with in-flight request coalescing so a crowd of players opening the same leaderboard at once triggers a single shared read instead of one per player.
-- **Failure-safe finalization** — a failed or partial read from the live data store is explicitly never written over a good snapshot, preventing a transient failure from blanking a leaderboard for everyone.
-- **Eager season-end payouts** — leaderboards that opt in get their final rankings built and reward tiers paid out to currently-online players immediately when a season rolls over, while offline players are safely caught by a lazy check on next login — with claim-tracking shared between both paths so nobody is double-paid.
+- **Config-driven leaderboards.** Each leaderboard is defined by its own player cap, season length, lock duration, and a check for which server types are allowed to perform the (expensive) rebuild.
+- **Single-writer locking.** A server must claim a lock in the datastore before rebuilding. If it stalls, the lock expires and another server takes over; if the original server finishes late anyway, its write is rejected since it no longer holds the lock.
+- **Failed reads never overwrite good data.** A partial or failed read from the datastore is discarded instead of saved, so a transient failure can't blank the board for everyone.
+- **Reads are decoupled from builds.** Any server can serve a cached leaderboard to players regardless of which server built it, and concurrent requests share a single read instead of hitting the datastore per player.
+- **Rate-limit-aware pacing.** Rebuilds check live request budget instead of running on a fixed timer, staying fast under normal load and backing off only under real contention.
